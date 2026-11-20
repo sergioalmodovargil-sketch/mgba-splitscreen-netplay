@@ -1,0 +1,38 @@
+# Software Information
+display_name = "mGBA Splitscreen"
+authors = "Spuds0588 (mgba-splitscreen), endrift (mGBA)"
+supported_extensions = "gba"
+corename = "mGBA Splitscreen"
+license = "MPLv2.0"
+permissions = ""
+categories = "Emulator"
+display_version = "0.1.0-netplay.1"
+
+# Hardware Information
+manufacturer = "Nintendo"
+systemname = "Game Boy Advance (2-4 linked players; multiplayer only)"
+systemid = "game_boy_advance"
+
+# Libretro Features
+supports_no_game = "false"
+database = "Nintendo - Game Boy Advance"
+savestate = "true"
+savestate_features = "deterministic"
+cheats = "false"
+input_descriptors = "true"
+memory_descriptors = "false"
+libretro_saves = "true"
+core_options = "true"
+load_subsystem = "true"
+hw_render = "false"
+needs_fullpath = "false"
+disk_control = "false"
+is_experimental = "true"
+
+description = "mGBA Splitscreen Netplay runs 2–4 linked Game Boy Advance instances in one libretro core. Supports local splitscreen and RetroArch Netplay with the same core build and ROM on every peer."
+
+# Firmware (optional, same entry upstream mGBA declares)
+firmware_count = 1
+firmware0_desc = "gba_bios.bin (Game Boy Advance BIOS)"
+firmware0_path = "gba_bios.bin"
+firmware0_opt = "true"

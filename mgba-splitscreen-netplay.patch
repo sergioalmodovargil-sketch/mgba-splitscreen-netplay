@@ -1,0 +1,779 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9264eb4..e9752c9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1062,7 +1062,7 @@ if(BUILD_LIBRETRO_SPLITSCREEN)
+ 	endif()
+ 	add_library(mgba_splitscreen_libretro SHARED ${SP_CORE_SRC} ${SP_SRC} ${SP_SIO_SRC} ${CORE_VFS_SRC})
+ 	add_dependencies(mgba_splitscreen_libretro ${BINARY_NAME}-version-info)
+-	set_target_properties(mgba_splitscreen_libretro PROPERTIES PREFIX "" OUTPUT_NAME "mgba_splitscreen_libretro" COMPILE_DEFINITIONS "__LIBRETRO__;COLOR_16_BIT;COLOR_5_6_5;DISABLE_THREADING;MGBA_STANDALONE;${OS_DEFINES};${FUNCTION_DEFINES};ENABLE_VFS;MINIMAL_CORE=2")
++	set_target_properties(mgba_splitscreen_libretro PROPERTIES PREFIX "" OUTPUT_NAME "mgba_splitscreen_libretro" COMPILE_DEFINITIONS "__LIBRETRO__;MGBA_LIBRETRO_SPLITSCREEN;COLOR_16_BIT;COLOR_5_6_5;DISABLE_THREADING;MGBA_STANDALONE;${OS_DEFINES};${FUNCTION_DEFINES};ENABLE_VFS;MINIMAL_CORE=2")
+ 	target_include_directories(mgba_splitscreen_libretro PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/libretro-splitscreen)
+ 	target_link_libraries(mgba_splitscreen_libretro ${OS_LIB})
+ 	if(MSVC)
+diff --git a/src/gba/cart/gpio.c b/src/gba/cart/gpio.c
+index f714cf8..7f40e6d 100644
+--- a/src/gba/cart/gpio.c
++++ b/src/gba/cart/gpio.c
+@@ -312,7 +312,20 @@ void _rtcUpdateClock(struct GBACartridgeHardware* hw) {
+ 	t -= hw->rtc.offset;
+ 
+ 	struct tm date;
+-	localtime_r(&t, &date);
++#ifdef MGBA_LIBRETRO_SPLITSCREEN
++	/* The splitscreen core supplies its generic RTC source. Keep synchronized
++	 * sessions independent of both wall-clock time and the host time zone. */
++	if (rtc && ((struct mRTCGenericSource*) rtc)->override == RTC_FAKE_EPOCH) {
++		const struct tm* utc = gmtime(&t);
++		if (!utc) {
++			return;
++		}
++		date = *utc;
++	} else
++#endif
++	{
++		localtime_r(&t, &date);
++	}
+ 	hw->rtc.time[0] = _rtcBCD(date.tm_year - 100);
+ 	hw->rtc.time[1] = _rtcBCD(date.tm_mon + 1);
+ 	hw->rtc.time[2] = _rtcBCD(date.tm_mday);
+@@ -580,5 +593,7 @@ void GBAHardwareDeserialize(struct GBACartridgeHardware* hw, const struct GBASer
+ 	}
+ 	if ((hw->p->memory.io[GBA_REG(SIOCNT)] & 0x0080) && when < 0x20000) {
+ 		mTimingSchedule(&hw->p->timing, &hw->p->sio.completeEvent, when);
++	} else {
++		hw->p->sio.completeEvent.when = mTimingCurrentTime(&hw->p->timing) + when;
+ 	}
+ }
+diff --git a/src/gba/io.c b/src/gba/io.c
+index 5de3880..d687b14 100644
+--- a/src/gba/io.c
++++ b/src/gba/io.c
+@@ -1042,6 +1042,10 @@ void GBAIOSerialize(struct GBA* gba, struct GBASerializedState* state) {
+ 		}
+ 	}
+ 
++#ifdef MGBA_LIBRETRO_SPLITSCREEN
++	/* The cable samples the transmit latch even though it is write-only. */
++	STORE_16(gba->memory.io[GBA_REG(SIOMLT_SEND)], GBA_REG_SIOMLT_SEND, state->io);
++#endif
+ 	for (i = 0; i < 4; ++i) {
+ 		STORE_16(gba->memory.io[(GBA_REG_DMA0CNT_LO + i * 12) >> 1], (GBA_REG_DMA0CNT_LO + i * 12), state->io);
+ 		STORE_16(gba->timers[i].reload, 0, &state->timers[i].reload);
+@@ -1087,7 +1091,16 @@ void GBAIODeserialize(struct GBA* gba, const struct GBASerializedState* state) {
+ 		}
+ 	}
+ 	gba->sio.siocnt = gba->memory.io[GBA_REG(SIOCNT)];
++#ifdef MGBA_LIBRETRO_SPLITSCREEN
++	LOAD_16(gba->memory.io[GBA_REG(SIOMLT_SEND)], GBA_REG_SIOMLT_SEND, state->io);
++	/* Restore the registers without queuing a new link-mode transition.
++	 * The saved driver state restores whatever was already in flight. */
++	gba->sio.rcnt = gba->memory.io[GBA_REG(RCNT)];
++	unsigned mode = ((gba->sio.rcnt & 0xC000) | (gba->sio.siocnt & 0x3000)) >> 12;
++	gba->sio.mode = (enum GBASIOMode) (mode < 8 ? mode & 0x3 : mode & 0xC);
++#else
+ 	GBASIOWriteRCNT(&gba->sio, gba->memory.io[GBA_REG(RCNT)]);
++#endif
+ 
+ 	LOAD_32(gba->bus, 0, &state->bus);
+ 	GBADMADeserialize(gba, state);
+diff --git a/src/gba/sio/lockstep.c b/src/gba/sio/lockstep.c
+index c3a4e0c..6edbad8 100644
+--- a/src/gba/sio/lockstep.c
++++ b/src/gba/sio/lockstep.c
+@@ -277,6 +277,7 @@ static void GBASIOLockstepDriverReset(struct GBASIODriver* driver) {
+ 	for (q = 0; q < MAX_LOCKSTEP_EVENTS - 1; ++q) {
+ 		player->buffer[q].next = &player->buffer[q + 1];
+ 	}
++	player->buffer[MAX_LOCKSTEP_EVENTS - 1].next = NULL;
+ 	player->freeList = &player->buffer[0];
+ 	if (player->driver->user->wake) {
+ 		player->driver->user->wake(player->driver->user);
+@@ -369,10 +370,14 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 	player->otherModes[2] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer2Mode(flags));
+ 	player->otherModes[3] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer3Mode(flags));
+ 
++	struct mTiming* timing = &driver->p->p->timing;
++	int32_t when;
++	LOAD_32LE(when, 0, &state->driver.nextEvent);
++	mTimingDeschedule(timing, &lockstep->event);
+ 	if (GBASIOLockstepSerializedFlagsGetEventScheduled(flags)) {
+-		int32_t when;
+-		LOAD_32LE(when, 0, &state->driver.nextEvent);
+-		mTimingSchedule(&driver->p->p->timing, &lockstep->event, when);
++		mTimingSchedule(timing, &lockstep->event, when);
++	} else {
++		lockstep->event.when = mTimingCurrentTime(timing) + (uint32_t) when;
+ 	}
+ 
+ 	if (GBASIOLockstepSerializedFlagsGetAsleep(flags)) {
+@@ -391,6 +396,7 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 	for (i = 0; i < MAX_LOCKSTEP_EVENTS - 1; ++i) {
+ 		player->buffer[i].next = &player->buffer[i + 1];
+ 	}
++	player->buffer[MAX_LOCKSTEP_EVENTS - 1].next = NULL;
+ 	player->freeList = &player->buffer[0];
+ 	player->queue = NULL;
+ 
+@@ -420,6 +426,7 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
+ 			break;
+ 		}
+ 	}
++	*lastEvent = NULL;
+ 
+ 	if (player->playerId == 0) {
+ 		LOAD_32LE(coordinator->cycle, 0, &state->coordinator.cycle);
+diff --git a/src/platform/libretro-splitscreen/instances.c b/src/platform/libretro-splitscreen/instances.c
+index f8534ca..ae8d4bb 100644
+--- a/src/platform/libretro-splitscreen/instances.c
++++ b/src/platform/libretro-splitscreen/instances.c
+@@ -17,6 +17,8 @@
+ 
+ #include <mgba/core/core.h>
+ #include <mgba/core/serialize.h>
++#include <mgba/internal/gba/gba.h>
++#include <mgba/internal/gba/serialize.h>
+ #include <mgba/core/timing.h>
+ #include <mgba/gba/interface.h>
+ #include <mgba/internal/gba/gba.h>
+@@ -89,6 +91,27 @@ static void _lockstepPlayerIdChanged(struct mLockstepUser* user, int id) {
+ 
+ /* ---- Loading ---- */
+ 
++/* RetroArch reads and receives SRAM during content/netplay setup, before the
++ * player-count menu has been confirmed. Keep the addresses stable across
++ * both the menu transition and rollbacks to a frame before that transition. */
++static uint8_t _saveData[SP_MAX_PLAYERS][GBA_SIZE_FLASH1M];
++
++void sp_init_savedata(void) {
++	memset(_saveData, 0xFF, sizeof(_saveData));
++}
++
++void sp_use_netplay_clock(struct sp_manager* sp) {
++	for (int i = 0; i < sp->nPlayers; ++i) {
++		struct mRTCGenericSource* rtc = &sp->players[i].core->rtc;
++		if (rtc->override != RTC_FAKE_EPOCH) {
++			rtc->override = RTC_FAKE_EPOCH;
++			/* January 2, 2000, at 12:00 UTC; advances with emulated frames. */
++			rtc->value = INT64_C(946814400000);
++		}
++	}
++}
++
++
+ static bool _spLoadOne(struct sp_player* p, int index, const void* rom, size_t romSize) {
+ 	memset(p, 0, sizeof(*p));
+ 	p->playerId = index;
+@@ -137,11 +160,7 @@ static bool _spLoadOne(struct sp_player* p, int index, const void* rom, size_t r
+ 
+ 	/* Battery save: flash-1M-sized buffer per player, wired after reset like
+ 	 * the upstream core's deferred setup (the frontend may fill it late). */
+-	p->saveData = anonymousMemoryMap(GBA_SIZE_FLASH1M);
+-	if (!p->saveData) {
+-		return false;
+-	}
+-	memset(p->saveData, 0xFF, GBA_SIZE_FLASH1M);
++	p->saveData = _saveData[index];
+ 	p->saveSize = GBA_SIZE_FLASH1M;
+ 
+ 	/* Link driver: create + attach BEFORE reset, or games see the cable
+@@ -252,10 +271,7 @@ void sp_deinit(struct sp_manager* sp) {
+ 			mappedMemoryFree(p->snapshot, SP_VIDEO_W * SP_VIDEO_H * BYTES_PER_PIXEL);
+ 			p->snapshot = NULL;
+ 		}
+-		if (p->saveData) {
+-			mappedMemoryFree(p->saveData, GBA_SIZE_FLASH1M);
+-			p->saveData = NULL;
+-		}
++		p->saveData = NULL;
+ 		p->saveSize = 0;
+ 		if (p->romData) {
+ 			mappedMemoryFree(p->romData, p->romSize);
+@@ -848,20 +864,11 @@ size_t sp_audio(struct sp_manager* sp, enum spAudio source, int16_t* out, size_t
+ #define SP_STATE_MAGIC 0x54535053u /* "SPST" little-endian */
+ #define SP_STATE_VERSION 1
+ 
+-size_t sp_serialize_size(struct sp_manager* sp) {
+-	/* Measure once per session: coordinator state is not independently
+-	 * serializable, so pad generously — each core's state plus the header,
+-	 * rounded up. The first serialize call fixes the value. */
+-	size_t total = 16; /* header */
+-	for (int i = 0; i < sp->nPlayers; ++i) {
+-		struct VFile* vfm = VFileMemChunk(NULL, 0);
+-		mCoreSaveStateNamed(sp->players[i].core, vfm, SAVESTATE_SAVEDATA | SAVESTATE_RTC);
+-		total += vfm->size(vfm) + 4096; /* per-player padding for growth */
+-		vfm->close(vfm);
+-	}
+-	/* Coordinator bookkeeping is small (a table + event queues); its content
+-	 * is rebuilt on unserialize via a driver reset, see below. */
+-	return total;
++size_t sp_serialize_max(int players) {
++	/* Flash may grow from undetected to 128 KiB after the first write. Also
++	 * reserve space for RTC, link-driver state and the extdata table. */
++	return 3 * sizeof(uint32_t) + (size_t) players *
++	       (sizeof(uint32_t) + sizeof(struct GBASerializedState) + GBA_SIZE_FLASH1M + 8192);
+ }
+ 
+ bool sp_serialize(struct sp_manager* sp, void* data, size_t size) {
+@@ -881,6 +888,9 @@ bool sp_serialize(struct sp_manager* sp, void* data, size_t size) {
+ 	bool ok = true;
+ 	for (int i = 0; i < sp->nPlayers && ok; ++i) {
+ 		struct VFile* vfm = VFileMemChunk(NULL, 0);
++		if (!vfm) {
++			return false;
++		}
+ 		ok = mCoreSaveStateNamed(sp->players[i].core, vfm, SAVESTATE_SAVEDATA | SAVESTATE_RTC);
+ 		ssize_t n = ok ? vfm->size(vfm) : 0;
+ 		if (ok && offset + (size_t) n > size) {
+@@ -903,7 +913,68 @@ bool sp_serialize(struct sp_manager* sp, void* data, size_t size) {
+ 	return ok;
+ }
+ 
+-bool sp_unserialize(struct sp_manager* sp, const void* data, size_t size) {
++enum {
++	SP_FS_CHECKED = 1 << 0,
++	SP_FS_SUPPRESSED = 1 << 1,
++	SP_FS_ENABLED = 1 << 2,
++	SP_FS_ARMED = 1 << 3,
++	SP_FS_ECHO = 1 << 4,
++	SP_FS_KICK = 1 << 5
++};
++
++void sp_save_fs_state(const struct sp_manager* sp, struct sp_fs_state* state) {
++	if (!sp->linkAttached) {
++		return;
++	}
++	const struct GBASIOLockstepCoordinator* link = &sp->coordinator;
++	state->flags = (link->fsAssistChecked ? SP_FS_CHECKED : 0) |
++	               (link->fsSuppressed ? SP_FS_SUPPRESSED : 0) |
++	               (link->fsAssistEnabled ? SP_FS_ENABLED : 0) |
++	               (link->fsAssistArmed ? SP_FS_ARMED : 0) |
++	               (link->fsAssistOn ? SP_FS_ECHO : 0) |
++	               (link->fsKickEnabled ? SP_FS_KICK : 0);
++	state->lastEcho = link->fsLastEcho;
++	state->logEvery = link->fsLogEvery;
++	state->handshakeRounds = link->fsHandshakeRounds;
++	state->quietRounds = link->fsQuietRounds;
++	state->kickCountdown = link->fsKickCountdown;
++	state->kicks = link->fsKicks;
++	memcpy(state->kickLastRecv, link->fsKickLastRecv, sizeof(state->kickLastRecv));
++}
++
++void sp_load_fs_state(struct sp_manager* sp, const struct sp_fs_state* state) {
++	if (!sp->linkAttached) {
++		return;
++	}
++	struct GBASIOLockstepCoordinator* link = &sp->coordinator;
++	link->fsAssistChecked = !!(state->flags & SP_FS_CHECKED);
++	link->fsSuppressed = !!(state->flags & SP_FS_SUPPRESSED);
++	sp->fsSuppressed = link->fsSuppressed;
++	link->fsAssistEnabled = !!(state->flags & SP_FS_ENABLED);
++	link->fsAssistArmed = !!(state->flags & SP_FS_ARMED);
++	link->fsAssistOn = !!(state->flags & SP_FS_ECHO);
++	link->fsKickEnabled = !!(state->flags & SP_FS_KICK);
++	link->fsLastEcho = state->lastEcho;
++	link->fsLogEvery = state->logEvery;
++	link->fsHandshakeRounds = state->handshakeRounds;
++	link->fsQuietRounds = state->quietRounds;
++	link->fsKickCountdown = state->kickCountdown;
++	link->fsKicks = state->kicks;
++	memcpy(link->fsKickLastRecv, state->kickLastRecv, sizeof(state->kickLastRecv));
++}
++
++uint32_t sp_timing_flags(const struct sp_manager* sp) {
++	uint32_t flags = 0;
++	for (int i = 0; i < sp->nPlayers; ++i) {
++		const struct GBA* gba = sp->players[i].core->board;
++		flags |= (uint32_t) !!gba->timing.reroot << (3 * i);
++		flags |= (uint32_t) gba->earlyExit << (3 * i + 1);
++		flags |= (uint32_t) mTimingIsScheduled(&gba->timing, &gba->sio.completeEvent) << (3 * i + 2);
++	}
++	return flags;
++}
++
++bool sp_unserialize(struct sp_manager* sp, const void* data, size_t size, const uint32_t* timingFlags) {
+ 	/* Layout must match sp_serialize: u32 magic | u32 version | u32 nPlayers
+ 	 * | u32 sliceLen[nPlayers] | per-player slices (core state + extdata). */
+ 	size_t headerSize = 3 * sizeof(uint32_t) + (size_t) sp->nPlayers * sizeof(uint32_t);
+@@ -923,18 +994,45 @@ bool sp_unserialize(struct sp_manager* sp, const void* data, size_t size) {
+ 		uint32_t len;
+ 		memcpy(&len, (const char*) data + 3 * sizeof(uint32_t) + (size_t) i * sizeof(len),
+ 		       sizeof(len));
+-		if (offset + len > size) {
++		if (len < sizeof(struct GBASerializedState) || len > size - offset) {
+ 			_spLog("unserialize: player %d slice %u overruns buffer", i, len);
+ 			return false;
+ 		}
+ 		struct VFile* vfm = VFileFromConstMemory((const char*) data + offset, len);
++		if (!vfm) {
++			return false;
++		}
+ 		bool ok = mCoreLoadStateNamed(sp->players[i].core, vfm, SAVESTATE_SAVEDATA | SAVESTATE_RTC);
+ 		vfm->close(vfm);
+ 		if (!ok) {
+ 			_spLog("unserialize: player %d failed at offset %zu", i, offset);
+ 			return false;
+ 		}
++		if (timingFlags) {
++			const struct GBASerializedState* state = (const void*) ((const char*) data + offset);
++			struct GBA* gba = sp->players[i].core->board;
++			/* mGBA interrupts the event queue on a manual state load. Resume
++			 * at the original event boundary for frame-exact netplay replay. */
++			if (*timingFlags & (1u << (3 * i))) {
++				mTimingInterrupt(&gba->timing);
++			} else if (gba->timing.reroot) {
++				gba->timing.root = gba->timing.reroot;
++				gba->timing.reroot = NULL;
++			}
++			gba->earlyExit = !!(*timingFlags & (1u << (3 * i + 1)));
++			bool completeScheduled = mTimingIsScheduled(&gba->timing, &gba->sio.completeEvent);
++			bool wantCompletion = !!(*timingFlags & (1u << (3 * i + 2)));
++			if (wantCompletion && !completeScheduled) {
++				int32_t when;
++				LOAD_32LE(when, 0, &state->hw.sioNextEvent);
++				mTimingSchedule(&gba->timing, &gba->sio.completeEvent, when);
++			} else if (!wantCompletion && completeScheduled) {
++				mTimingDeschedule(&gba->timing, &gba->sio.completeEvent);
++			}
++			LOAD_32LE(gba->cpu->nextEvent, 0, &state->cpu.nextEvent);
++		}
+ 		offset += len;
++		sp->players[i].lastFrameCounter = sp->players[i].core->frameCounter(sp->players[i].core);
+ 	}
+ 	/* NOTE: no coordinator reset here. The lockstep driver serializes its full
+ 	 * state through each core's savestate (player queues, cycle offsets, sleep
+@@ -948,24 +1046,26 @@ bool sp_unserialize(struct sp_manager* sp, const void* data, size_t size) {
+ /* ---- Memory interface ---- */
+ 
+ void* sp_memory_data(struct sp_manager* sp, unsigned id) {
++	UNUSED(sp);
+ 	if (id == RETRO_MEMORY_SAVE_RAM) {
+-		return sp->players[0].saveData;
++		return _saveData[0];
+ 	}
+ 	/* TGB Dual convention: RETRO_MEMORY_GAMEBOY_1_SRAM + (n-1) — these ids are
+ 	 * frontend-defined subsystem memory types declared in the manifest; the
+ 	 * core maps them to players 1..3. */
+ 	if (id >= 0x100 && id < 0x100 + SP_MAX_PLAYERS - 1) {
+-		return sp->players[id - 0x100 + 1].saveData;
++		return _saveData[id - 0x100 + 1];
+ 	}
+ 	return NULL;
+ }
+ 
+ size_t sp_memory_size(struct sp_manager* sp, unsigned id) {
++	UNUSED(sp);
+ 	if (id == RETRO_MEMORY_SAVE_RAM) {
+-		return sp->players[0].saveSize;
++		return sizeof(_saveData[0]);
+ 	}
+ 	if (id >= 0x100 && id < 0x100 + SP_MAX_PLAYERS - 1) {
+-		return sp->players[id - 0x100 + 1].saveSize;
++		return sizeof(_saveData[0]);
+ 	}
+ 	return 0;
+ }
+diff --git a/src/platform/libretro-splitscreen/instances.h b/src/platform/libretro-splitscreen/instances.h
+index 6857f6c..bd8fd1e 100644
+--- a/src/platform/libretro-splitscreen/instances.h
++++ b/src/platform/libretro-splitscreen/instances.h
+@@ -146,9 +146,27 @@ void sp_set_fs_assist(struct sp_manager* sp, bool on);
+ 
+ /* Deterministic save-state serialization: coordinator + every core, padded to
+  * a fixed size (retro_serialize_size must never shrink mid-session). */
+-size_t sp_serialize_size(struct sp_manager* sp);
++size_t sp_serialize_max(int players);
++void sp_init_savedata(void);
++void sp_use_netplay_clock(struct sp_manager* sp);
+ bool sp_serialize(struct sp_manager* sp, void* data, size_t size);
+-bool sp_unserialize(struct sp_manager* sp, const void* data, size_t size);
++/* Four Swords assist includes a cable-protocol watchdog. Snapshot the
++ * counters and latched policy along with the base SIO driver state. */
++struct sp_fs_state {
++	uint32_t flags;
++	uint32_t lastEcho;
++	uint32_t logEvery;
++	uint32_t handshakeRounds;
++	uint32_t quietRounds;
++	uint32_t kickCountdown;
++	uint32_t kicks;
++	uint32_t kickLastRecv[SP_MAX_PLAYERS];
++};
++
++void sp_save_fs_state(const struct sp_manager* sp, struct sp_fs_state* state);
++void sp_load_fs_state(struct sp_manager* sp, const struct sp_fs_state* state);
++uint32_t sp_timing_flags(const struct sp_manager* sp);
++bool sp_unserialize(struct sp_manager* sp, const void* data, size_t size, const uint32_t* timingFlags);
+ 
+ /* Memory interface: player 0's save on RETRO_MEMORY_SAVE_RAM, players 1..3 on
+  * RETRO_MEMORY_GAMEBOY_1_SRAM.. (TGB Dual's convention). */
+diff --git a/src/platform/libretro-splitscreen/instances_menu.c b/src/platform/libretro-splitscreen/instances_menu.c
+index d8d1557..d2fe6ba 100644
+--- a/src/platform/libretro-splitscreen/instances_menu.c
++++ b/src/platform/libretro-splitscreen/instances_menu.c
+@@ -251,6 +251,20 @@ void spMenuStart(int defaultPlayers) {
+ 	sFrames = 0;
+ }
+ 
++void spMenuSave(uint32_t state[3]) {
++	state[0] = sSel;
++	state[1] = sLastKeys;
++	state[2] = sFrames;
++}
++
++void spMenuRestore(const uint32_t state[3]) {
++	sActive = true;
++	sConfirmed = false;
++	sSel = state[0];
++	sLastKeys = state[1];
++	sFrames = state[2];
++}
++
+ bool spMenuActive(void) {
+ 	return sActive;
+ }
+diff --git a/src/platform/libretro-splitscreen/instances_menu.h b/src/platform/libretro-splitscreen/instances_menu.h
+index 675685a..17c3939 100644
+--- a/src/platform/libretro-splitscreen/instances_menu.h
++++ b/src/platform/libretro-splitscreen/instances_menu.h
+@@ -15,6 +15,10 @@ void spMenuStart(int defaultPlayers);
+ /* True while the boot menu is showing. */
+ bool spMenuActive(void);
+ 
++/* The confirmation is consumed in the same retro_run that sets it. */
++void spMenuSave(uint32_t state[3]);
++void spMenuRestore(const uint32_t state[3]);
++
+ /* Advance the menu one frame: read P1 input, redraw, and flip to confirmed
+  * on A/Start. Draws through the same sp_video the game frames use. */
+ void spMenuFrame(struct sp_video* vid, void (*poll)(void), uint32_t (*readKeys)(unsigned port));
+diff --git a/src/platform/libretro-splitscreen/libretro.c b/src/platform/libretro-splitscreen/libretro.c
+index 18eb2ec..166e38e 100644
+--- a/src/platform/libretro-splitscreen/libretro.c
++++ b/src/platform/libretro-splitscreen/libretro.c
+@@ -46,6 +46,14 @@ static size_t romCopySize;
+ static char romPath[PATH_MAX];
+ static bool havePath;
+ static bool pendingLoad;    /* deferred until first retro_run (options ready) */
++static int subsystemPlayers;
++static bool netplayClock;
++static bool netplayFsAssist;
++
++/* This fork's libretro.h predates the context query in RetroArch 1.22.2. */
++#define SP_ENV_GET_SAVESTATE_CONTEXT (72 | RETRO_ENVIRONMENT_EXPERIMENTAL)
++#define SP_CONTEXT_ROLLBACK_NETPLAY 3
++
+ static int pendingPlayers;
+ static bool menuActive;     /* in-core boot menu (single-ROM quick path) */
+ static unsigned lastWidth = 240;
+@@ -60,6 +68,16 @@ static bool fsAssistOpt = false;
+ static bool overlaysOpt = true;
+ static bool lowPassOpt = false;  /* audio post: single-pole low-pass */
+ static bool limiterOpt = true;   /* audio post: soft-knee limiter */
++
++static void _useNetplayClock(void) {
++	int context = 0;
++	if (!netplayClock && environCallback(SP_ENV_GET_SAVESTATE_CONTEXT, &context) &&
++	    context == SP_CONTEXT_ROLLBACK_NETPLAY) {
++		netplayClock = true;
++		netplayFsAssist = fsAssistOpt;
++		sp_use_netplay_clock(&sp);
++	}
++}
+ static unsigned advertisedRate; /* audio rate last sent via SET_SYSTEM_AV_INFO */
+ static bool coreOptionsChanged; /* option visibility changed since last poll */
+ 
+@@ -93,6 +111,18 @@ static void _spLogLine(const char* line) {
+ 	}
+ }
+ 
++static void _logGBA(struct mLogger* logger, int category, enum mLogLevel level,
++                    const char* fmt, va_list args) {
++	UNUSED(logger);
++	if (!logCallback || !(level & (mLOG_FATAL | mLOG_ERROR | mLOG_WARN))) {
++		return;
++	}
++	char line[256];
++	vsnprintf(line, sizeof(line), fmt, args);
++	logCallback(level == mLOG_WARN ? RETRO_LOG_WARN : RETRO_LOG_ERROR,
++	            "[mGBA] %s: %s\n", mLogCategoryName(category), line);
++}
++
+ /* ---- Core options (v2) ----
+  * Sent as a full static table; the view-layout VALUE LIST is rebuilt whenever
+  * the number of emulated sessions changes (views that cannot hold N players
+@@ -267,8 +297,11 @@ static const struct retro_subsystem_info _subsystems[] = {
+ };
+ 
+ static void _applyFsAssist(void) {
+-	if (sp.linkAttached) {
+-		sp_set_fs_assist(&sp, fsAssistOpt);
++	/* The host shares this emulation setting in the initial state. View
++	 * settings such as audio selection and layout stay local. */
++	bool assist = netplayClock ? netplayFsAssist : fsAssistOpt;
++	if (sp.linkAttached && sp.fsSuppressed == assist) {
++		sp_set_fs_assist(&sp, assist);
+ 	}
+ }
+ 
+@@ -448,7 +481,7 @@ static void _applyGeometry(void) {
+ 		info.geometry.aspect_ratio = wantW / (double) wantH;
+ 		info.geometry.max_width = SP_MAX_W;
+ 		info.geometry.max_height = SP_MAX_H;
+-		environCallback(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
++		environCallback(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
+ 		lastWidth = wantW;
+ 		lastHeight = wantH;
+ 		baseWidth = wantW;
+@@ -480,6 +513,9 @@ static bool _doLoad(int nPlayers, const void* data, size_t size, const char* pat
+ 	if (!sp_load(&sp, nPlayers, data, size, &vid)) {
+ 		return false;
+ 	}
++	if (netplayClock) {
++		sp_use_netplay_clock(&sp);
++	}
+ 	advertisedRate = sp.players[0].core->audioSampleRate(sp.players[0].core);
+ 	_geometryFromPlayers(nPlayers);
+ 	_applyFsAssist();
+@@ -560,7 +596,7 @@ void retro_set_input_state(retro_input_state_t input) {
+ void retro_get_system_info(struct retro_system_info* info) {
+ 	info->need_fullpath = false;
+ 	info->valid_extensions = "gba";
+-	info->library_version = "0.1.0";
++	info->library_version = "0.1.0-netplay.1";
+ 	info->library_name = "mGBA Splitscreen";
+ 	info->block_extract = false;
+ }
+@@ -619,13 +655,13 @@ void retro_init(void) {
+ 	vid.audio = SP_AUDIO_P1;
+ 	_initOptionDefs();
+ 
+-	static struct mLogger logger; /* lives for the process: fine, global state allowed */
+-	logger.log = 0;
+-	(void) logger;
++	static struct mLogger logger = { .log = _logGBA };
++	mLogSetDefaultLogger(&logger);
+ }
+ 
+ void retro_deinit(void) {
+ 	sp_deinit(&sp);
++	mLogSetDefaultLogger(NULL);
+ 	free(vid.out);
+ 	memset(&vid, 0, sizeof(vid));
+ 	free(romCopy);
+@@ -638,8 +674,9 @@ void retro_reset(void) {
+ 	 * to a full SIO teardown+rebuild, which only this path or retro_unload_game
+ 	 * can produce. Log which one the frontend asked for. */
+ 	_spLogLine("frontend requested RESET (retro_reset)");
+-	sp_reset(&sp);
+-	menuActive = false; /* a reset restarts the game, not the boot menu */
++	if (sp.nPlayers) {
++		sp_reset(&sp);
++	}
+ }
+ 
+ static uint32_t _readKeys(unsigned port) {
+@@ -733,11 +770,20 @@ void retro_run(void) {
+ }
+ 
+ bool retro_load_game(const struct retro_game_info* game) {
++	if (!game || !game->data || !game->size) {
++		return false;
++	}
++	subsystemPlayers = 0;
++	netplayClock = false;
++	sp_init_savedata();
+ 	/* Copy the ROM now (need_fullpath=false guarantees game->data), defer the
+ 	 * heavy N-instance construction until retro_run: the frontend's core
+ 	 * options are only reliable after the load call returns. */
+ 	romCopySize = game->size;
+ 	romCopy = malloc(romCopySize);
++	if (!romCopy) {
++		return false;
++	}
+ 	memcpy(romCopy, game->data, romCopySize);
+ 	if (game->path) {
+ 		snprintf(romPath, sizeof(romPath), "%s", game->path);
+@@ -779,9 +825,17 @@ bool retro_load_game_special(unsigned game_type, const struct retro_game_info* i
+ 		return false;
+ 	}
+ 	/* All entries must be GBA ROMs; player 1's is the primary content. */
+-	size_t size = info[0].size;
+-	romCopySize = size;
++	if (!info[0].data || !info[0].size) {
++		return false;
++	}
++	subsystemPlayers = n;
++	netplayClock = false;
++	sp_init_savedata();
++	romCopySize = info[0].size;
+ 	romCopy = malloc(romCopySize);
++	if (!romCopy) {
++		return false;
++	}
+ 	memcpy(romCopy, info[0].data, romCopySize);
+ 	if (info[0].path) {
+ 		snprintf(romPath, sizeof(romPath), "%s", info[0].path);
+@@ -824,31 +878,133 @@ void retro_set_controller_port_device(unsigned port, unsigned device) {
+ 	UNUSED(device);
+ }
+ 
++/* Outer state also represents the in-core menu and the deferred first frame,
++ * both of which can be the state received by a late-joining peer. */
++enum spStateKind {
++	SP_STATE_MENU = 1,
++	SP_STATE_PENDING,
++	SP_STATE_GAME
++};
++
++#define SP_STATE_NETPLAY_MAGIC UINT32_C(0x31504E53) /* SNP1 */
++#define SP_STATE_OLD_MAGIC UINT32_C(0x54535053) /* SPST */
++
++struct sp_state_header {
++	uint32_t magic;
++	uint32_t kind;
++	uint32_t players;
++	uint32_t menu[3];
++	uint32_t stallRun;
++	uint32_t timingFlags;
++	uint32_t fsAssist;
++	struct sp_fs_state fs;
++};
++
+ size_t retro_serialize_size(void) {
+-	if (!sp.nPlayers) {
++	if (!romCopy) {
+ 		return 0;
+ 	}
+-	/* Fixed at first call per session via the padded measure in instances.c:
+-	 * the value must never INCREASE during a session, so measure generously. */
+-	static size_t cached = 0;
+-	if (!cached) {
+-		cached = sp_serialize_size(&sp);
+-	}
+-	return cached;
++	_useNetplayClock();
++	return sizeof(struct sp_state_header) + sp_serialize_max(subsystemPlayers ? subsystemPlayers : SP_MAX_PLAYERS);
+ }
+ 
+ bool retro_serialize(void* data, size_t size) {
+-	if (!sp.nPlayers) {
++	if (!romCopy || size < sizeof(struct sp_state_header)) {
+ 		return false;
+ 	}
+-	return sp_serialize(&sp, data, size);
++	_useNetplayClock();
++	struct sp_state_header header = {0};
++	header.magic = SP_STATE_NETPLAY_MAGIC;
++	header.players = sp.nPlayers ? sp.nPlayers : pendingPlayers;
++	header.kind = sp.nPlayers ? SP_STATE_GAME : menuActive ? SP_STATE_MENU : SP_STATE_PENDING;
++	if (menuActive) {
++		spMenuSave(header.menu);
++	}
++	header.stallRun = sp.stallRun;
++	header.timingFlags = sp_timing_flags(&sp);
++	header.fsAssist = netplayClock ? netplayFsAssist : fsAssistOpt;
++	sp_save_fs_state(&sp, &header.fs);
++	memcpy(data, &header, sizeof(header));
++	uint8_t* payload = (uint8_t*) data + sizeof(header);
++	size_t remaining = size - sizeof(header);
++	if (header.kind == SP_STATE_GAME) {
++		return sp_serialize(&sp, payload, remaining);
++	}
++	const unsigned banks = subsystemPlayers ? subsystemPlayers : SP_MAX_PLAYERS;
++	const size_t bankSize = sp_memory_size(&sp, RETRO_MEMORY_SAVE_RAM);
++	if (remaining < banks * bankSize) {
++		return false;
++	}
++	for (unsigned i = 0; i < banks; ++i) {
++		memcpy(payload + i * bankSize, sp_memory_data(&sp, i ? SP_MEMORY_P2 + i - 1 : RETRO_MEMORY_SAVE_RAM), bankSize);
++	}
++	memset(payload + banks * bankSize, 0, remaining - banks * bankSize);
++	return true;
+ }
+ 
+ bool retro_unserialize(const void* data, size_t size) {
+-	if (!sp.nPlayers) {
++	if (!romCopy || size < 3 * sizeof(uint32_t)) {
++		return false;
++	}
++	_useNetplayClock();
++	struct sp_state_header header = {0};
++	memcpy(&header, data, 3 * sizeof(uint32_t));
++	const uint8_t* payload = data;
++	size_t remaining = size;
++	if (header.magic == SP_STATE_OLD_MAGIC) {
++		header.kind = SP_STATE_GAME;
++	} else if (header.magic == SP_STATE_NETPLAY_MAGIC && size >= sizeof(header)) {
++		memcpy(&header, data, sizeof(header));
++		payload += sizeof(header);
++		remaining -= sizeof(header);
++	} else {
+ 		return false;
+ 	}
+-	return sp_unserialize(&sp, data, size);
++	if (!header.players || header.players > SP_MAX_PLAYERS ||
++	    (subsystemPlayers && header.players != (unsigned) subsystemPlayers)) {
++		return false;
++	}
++	const bool hasExtendedState = header.magic == SP_STATE_NETPLAY_MAGIC;
++	if (hasExtendedState && netplayClock) {
++		netplayFsAssist = !!header.fsAssist;
++	}
++	if (header.kind == SP_STATE_GAME) {
++		if (sp.nPlayers != (int) header.players &&
++		    !_doLoad(header.players, romCopy, romCopySize, havePath ? romPath : NULL)) {
++			return false;
++		}
++		if (!sp_unserialize(&sp, payload, remaining, hasExtendedState ? &header.timingFlags : NULL)) {
++			return false;
++		}
++		sp.stallRun = header.stallRun;
++		if (hasExtendedState) {
++			sp_load_fs_state(&sp, &header.fs);
++		}
++		menuActive = false;
++		pendingLoad = false;
++		return true;
++	}
++	if ((header.kind != SP_STATE_MENU && header.kind != SP_STATE_PENDING) ||
++	    (header.kind == SP_STATE_MENU && (subsystemPlayers || header.menu[0] > 2))) {
++		return false;
++	}
++	const unsigned banks = subsystemPlayers ? subsystemPlayers : SP_MAX_PLAYERS;
++	const size_t bankSize = sp_memory_size(&sp, RETRO_MEMORY_SAVE_RAM);
++	if (remaining < banks * bankSize) {
++		return false;
++	}
++	sp_deinit(&sp);
++	sp.stallRun = 0;
++	for (unsigned i = 0; i < banks; ++i) {
++		memcpy(sp_memory_data(&sp, i ? SP_MEMORY_P2 + i - 1 : RETRO_MEMORY_SAVE_RAM), payload + i * bankSize, bankSize);
++	}
++	pendingPlayers = header.players;
++	pendingLoad = true;
++	menuActive = header.kind == SP_STATE_MENU;
++	if (menuActive) {
++		spMenuRestore(header.menu);
++	}
++	return true;
+ }
+ 
+ void retro_cheat_reset(void) {
+@@ -862,14 +1018,14 @@ void retro_cheat_set(unsigned index, bool enabled, const char* code) {
+ }
+ 
+ void* retro_get_memory_data(unsigned id) {
+-	if (!sp.nPlayers) {
++	if (!romCopy) {
+ 		return NULL;
+ 	}
+ 	return sp_memory_data(&sp, id);
+ }
+ 
+ size_t retro_get_memory_size(unsigned id) {
+-	if (!sp.nPlayers) {
++	if (!romCopy) {
+ 		return 0;
+ 	}
+ 	return sp_memory_size(&sp, id);
